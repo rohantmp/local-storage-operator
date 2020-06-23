@@ -54,3 +54,8 @@ test:
 test_e2e:
 	./hack/test-e2e.sh
 .PHONY: test
+
+update-generated:
+	./hack/update-generated.sh
+
+.PHONY: update-generated
