@@ -135,8 +135,9 @@ roleRef:
   kind: ClusterRole
   name: local-storage-operator
 subjects:
-  - kind: ServiceAccount
-    name: local-storage-operator
+- kind: ServiceAccount
+  name: local-storage-operator
+  namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -145,6 +146,7 @@ metadata:
 subjects:
 - kind: ServiceAccount
   name: local-storage-operator
+  namespace: default
 roleRef:
   kind: ClusterRole
   name: system:persistent-volume-provisioner
@@ -157,6 +159,7 @@ metadata:
 subjects:
 - kind: ServiceAccount
   name: local-storage-admin
+  namespace: default
 roleRef:
   kind: ClusterRole
   name: system:persistent-volume-provisioner
@@ -170,6 +173,7 @@ metadata:
 subjects:
 - kind: ServiceAccount
   name: local-storage-admin
+  namespace: default
 roleRef:
   kind: ClusterRole
   name: local-storage-provisioner-node-clusterrole
