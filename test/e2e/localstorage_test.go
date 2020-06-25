@@ -12,6 +12,7 @@ import (
 	operatorv1 "github.com/openshift/api/operator/v1"
 	localapisv1 "github.com/openshift/local-storage-operator/pkg/apis"
 	localv1 "github.com/openshift/local-storage-operator/pkg/apis/local/v1"
+	localv1alpha1 "github.com/openshift/local-storage-operator/pkg/apis/local/v1alpha1"
 	commontypes "github.com/openshift/local-storage-operator/pkg/common"
 	framework "github.com/operator-framework/operator-sdk/pkg/test"
 	"github.com/operator-framework/operator-sdk/pkg/test/e2eutil"
@@ -38,6 +39,11 @@ var (
 func TestLocalStorageOperator(t *testing.T) {
 	localVolumeList := &localv1.LocalVolumeList{}
 	err := framework.AddToFrameworkScheme(localapisv1.AddToScheme, localVolumeList)
+	if err != nil {
+		t.Fatalf("error adding local volume list : %v", err)
+	}
+	localVolumeSetList := &localv1alpha1.LocalVolumeSetList{}
+	err = framework.AddToFrameworkScheme(localapisv1.AddToScheme, localVolumeSetList)
 	if err != nil {
 		t.Fatalf("error adding local volume list : %v", err)
 	}
