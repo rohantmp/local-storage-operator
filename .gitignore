@@ -4,3 +4,4 @@ diskmaker
 !diskmaker/
 cover.out
 _output
+.vscode/
