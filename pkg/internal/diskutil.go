@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -142,7 +143,10 @@ func (b BlockDevice) GetPathByID() (string, error) {
 func PathEvalsToDiskLabel(path, devName string) (bool, error) {
 	devPath, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return false, errors.Wrapf(err, "could not eval symLink %q", path)
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("could not eval symLink %q:%w", devPath, err)
 	}
 	if filepath.Base(devPath) == devName {
 		return true, nil

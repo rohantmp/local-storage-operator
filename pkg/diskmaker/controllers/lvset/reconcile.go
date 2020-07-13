@@ -56,8 +56,7 @@ func (r *ReconcileLocalVolumeSet) Reconcile(request reconcile.Request) (reconcil
 	}
 
 	// ignore LocalVolmeSets whose LabelSelector doesn't match this node
-	// NodeSelectorTerms.MatchExpressions are ORed, MatchFields are ignored.
-
+	// NodeSelectorTerms.MatchExpressions are ORed
 	matches, err := nodeSelectorMatchesNodeLabels(node, instance.Spec.NodeSelector)
 	if err != nil {
 		reqLogger.Error(err, "failed to match nodeSelector to node labels")
@@ -133,6 +132,23 @@ DeviceLoop:
 
 	}
 
+	// process files in symlinkdir:
+	// matches PV, delete PV
+	// is Symlink, matching symlink, leave it alone, else remove it
+	// remove finalizer.
+
+	// list PVs
+
+	// pvList := &corev1.PersistentVolumeList{}
+	// err = r.client.List(
+	// 	context.TODO(),
+	// 	pvList,
+	// 	client.MatchingLabels{
+	// 		util.OwnerNameLabel:      instance.GetName(),
+	// 		util.OwnerNamespaceLabel: instance.GetNamespace(),
+	// 	},
+	// )
+
 	// process valid devices
 	var noMatch []string
 	for _, blockDevice := range validDevices {
@@ -161,6 +177,8 @@ DeviceLoop:
 	if len(noMatch) > 0 {
 		reqLogger.Info("found stale symLink Entries", "storageClass.Name", storageClass, "paths.List", noMatch)
 	}
+
+	// process devices to clean up
 
 	return reconcile.Result{Requeue: true, RequeueAfter: time.Minute}, nil
 }
@@ -199,7 +217,7 @@ func symLinkDisk(dev internal.BlockDevice, symLinkDir string) error {
 	// ensure symLinkDirExists
 	err = os.MkdirAll(symLinkDir, 0755)
 	if err != nil {
-		return errors.Wrap(err, "could not create symlinkdir")
+		return fmt.Errorf("could not create symlinkdir: %w", err)
 	}
 	deviceID := filepath.Base(pathByID)
 	symLinkPath := path.Join(symLinkDir, deviceID)

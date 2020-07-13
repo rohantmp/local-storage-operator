@@ -17,6 +17,9 @@ const (
 	DefaultPVClusterRole           = "system:persistent-volume-provisioner"
 	ProvisionerNodeRoleBindingName = "local-storage-provisioner-node-binding"
 
+	OwnerNamespaceLabel = "local.storage.openshift.io/owner-namespace"
+	OwnerNameLabel      = "local.storage.openshift.io/owner-name"
+
 	DiskMakerImageEnv    = "DISKMAKER_IMAGE"
 	ProvisionerImageEnv  = "PROVISIONER_IMAGE"
 	LocalDiskLocationEnv = "LOCAL_DISK_LOCATION"

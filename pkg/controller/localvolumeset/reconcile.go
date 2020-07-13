@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-logr/logr"
 	localv1alpha1 "github.com/openshift/local-storage-operator/pkg/apis/local/v1alpha1"
+	"github.com/openshift/local-storage-operator/pkg/controller/util"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -115,6 +116,12 @@ func (r *LocalVolumeSetReconciler) syncStorageClass(lvs *localv1alpha1.LocalVolu
 			storageClass.Provisioner = "kubernetes.io/no-provisioner"
 			storageClass.ReclaimPolicy = &deleteReclaimPolicy
 			storageClass.VolumeBindingMode = &firstConsumerBinding
+			storageClass.ObjectMeta.Labels = map[string]string{
+				util.OwnerNameLabel:      lvs.GetName(),
+				util.OwnerNamespaceLabel: lvs.GetNamespace(),
+			}
+			storageClass.ObjectMeta.Labels[util.OwnerNameLabel] = lvs.GetName()
+			storageClass.ObjectMeta.Labels[util.OwnerNamespaceLabel] = lvs.GetNamespace()
 		}
 		return nil
 	})
