@@ -13,7 +13,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -108,26 +107,19 @@ func (r *LocalVolumeSetReconciler) syncStorageClass(lvs *localv1alpha1.LocalVolu
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      lvs.Spec.StorageClassName,
 			Namespace: lvs.GetNamespace(),
-		},
-	}
-
-	_, err := controllerutil.CreateOrUpdate(context.TODO(), r.client, storageClass, func() error {
-		if storageClass.CreationTimestamp.IsZero() {
-			storageClass.Provisioner = "kubernetes.io/no-provisioner"
-			storageClass.ReclaimPolicy = &deleteReclaimPolicy
-			storageClass.VolumeBindingMode = &firstConsumerBinding
-			storageClass.ObjectMeta.Labels = map[string]string{
+			Labels: map[string]string{
 				util.OwnerNameLabel:      lvs.GetName(),
 				util.OwnerNamespaceLabel: lvs.GetNamespace(),
-			}
-			storageClass.ObjectMeta.Labels[util.OwnerNameLabel] = lvs.GetName()
-			storageClass.ObjectMeta.Labels[util.OwnerNamespaceLabel] = lvs.GetNamespace()
-		}
-		return nil
-	})
+			},
+		},
+		Provisioner:       "kubernetes.io/no-provisioner",
+		ReclaimPolicy:     &deleteReclaimPolicy,
+		VolumeBindingMode: &firstConsumerBinding,
+	}
+
+	err := r.client.Create(context.TODO(), storageClass)
 	if err != nil && !errors.IsAlreadyExists(err) {
 		return err
 	}
-
 	return nil
 }
