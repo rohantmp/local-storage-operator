@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -221,7 +222,89 @@ RowLoop:
 	return blockDevices, badRows, nil
 }
 
-// LsblkOutput is the structured output of lsblk when outputted in json
-// type LsblkOutput struct {
-// 	Blockdevices []BlockDevice `json:"blockdevices"`
-// }
+// PVCreationLock checks whether a PV can be created based on this device
+// and Locks the device so that no PVs can be created on it while the lock is held.
+// the PV lock will fail if:
+// - another process holds an exclusive file lock on the device (using the syscall flock)
+// - a symlink to this device exists in symlinkDirs
+// returns:
+// ExclusiveFileLock, must be unlocked
+// bool determines if flock was placed on device.
+// error
+func PVCreationLock(device string, symlinkDirs ...string) (ExclusiveFileLock, bool, error) {
+	lock := ExclusiveFileLock{Path: device}
+	locked, err := lock.Lock()
+	if err != nil || !locked {
+		return lock, false, err
+	}
+
+	for _, dir := range symlinkDirs {
+		links, err := GetMatchingSymlinksInDir(dir, device)
+		// return false if symlinks exist
+		if err != nil || len(links) > 0 {
+			return lock, false, err
+		}
+	}
+	return lock, true, nil
+}
+
+// GetMatchingSymlinksInDir returns all the files in dir that are the same file as path after evaluating symlinks
+// it works using `find -L dir -samefile path`
+func GetMatchingSymlinksInDir(dir, path string) ([]string, error) {
+	cmd := exec.Command("find", "-L", dir, "-samefile", path)
+	output, err := executeCmd(cmd)
+	if err != nil {
+		return []string{}, fmt.Errorf("failed to get symlinks in directory %q for device ID %q. %v", dir, path, err)
+	}
+	return strings.Split(strings.TrimSuffix(output, "\n"), "\n"), nil
+}
+
+func executeCmd(cmd *exec.Cmd) (string, error) {
+	var out bytes.Buffer
+	var err error
+	cmd.Stdout = &out
+	err = cmd.Run()
+	if err != nil {
+		return "", err
+	}
+
+	return out.String(), nil
+}
+
+type ExclusiveFileLock struct {
+	Path   string
+	locked bool
+	fd     int
+}
+
+// Lock locks the file so other process cannot open the file
+func (e *ExclusiveFileLock) Lock() (bool, error) {
+	fd, errno := unix.Open(e.Path, unix.O_RDONLY|unix.O_EXCL, 0)
+	e.fd = fd
+
+	if errno == unix.EBUSY {
+		// device is in use
+		return false, nil
+	} else if errno != nil {
+		return false, errno
+	}
+
+	errno = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+	if errno == unix.EWOULDBLOCK {
+		e.locked = false
+	} else if errno == nil {
+		e.locked = true
+	} else if errno != nil {
+
+	}
+	return e.locked, nil
+}
+
+// Unlock releases the lock
+func (e *ExclusiveFileLock) Unlock() error {
+	if e.locked {
+		return unix.Close(e.fd)
+	}
+	return nil
+
+}
