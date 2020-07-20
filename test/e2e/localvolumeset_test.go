@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -58,10 +59,6 @@ func LocalVolumeSetTest(ctx *framework.Context, cleanupFuncs *[]cleanupFn) func(
 				disks: []int{10, 20, 30, 40},
 				node:  nodeList.Items[1],
 			},
-			{
-				disks: []int{10, 20, 30, 40},
-				node:  nodeList.Items[2],
-			},
 		}
 
 		t.Log("getting AWS region info from node spec")
@@ -89,13 +86,17 @@ func LocalVolumeSetTest(ctx *framework.Context, cleanupFuncs *[]cleanupFn) func(
 			_, err := createAndAttachAWSVolumes(t, ec2Client, ctx, namespace, nodeDisks.node, nodeDisks.disks...)
 			matcher.Expect(err).NotTo(gomega.HaveOccurred(), "createAndAttachAWSVolumes: %+v", nodeDisks)
 		}
-
+		tenGi := resource.MustParse("10G")
 		twentyGi := resource.MustParse("20G")
 		fiftyGi := resource.MustParse("50G")
 		two := int32(2)
 		three := int32(3)
 
+		lvSets := []*localv1alpha1.LocalVolumeSet{}
+
 		// start the lvset with a size range of twenty to fifty on the first node
+		// will be created first
+		// should match amd claim nodeEnv[0].disks: 20,30,40
 		smallLVSet := &localv1alpha1.LocalVolumeSet{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "small-1",
@@ -124,13 +125,40 @@ func LocalVolumeSetTest(ctx *framework.Context, cleanupFuncs *[]cleanupFn) func(
 				},
 			},
 		}
-		// delete PVs
+		lvSets = append(lvSets, smallLVSet)
 
-		t.Log("creating localvolumeset")
+		// create an identical lvset with an overlap
+		// nodeEnv[0].disks
+		// match and claim 1 disk from: 10
+		// match and not claim 3 disks from: 20, 30, 40
+		overlappingLVSet := &localv1alpha1.LocalVolumeSet{}
+		smallLVSet.DeepCopyInto(overlappingLVSet)
+		overlappingLVSet.ObjectMeta.Name = fmt.Sprintf("overlapping-%s", smallLVSet.GetName())
+		overlappingLVSet.Spec.StorageClassName = overlappingLVSet.GetName()
+
+		// introduce differences
+		overlappingLVSet.Spec.DeviceInclusionSpec.MinSize = &tenGi
+
+		lvSets = []*localv1alpha1.LocalVolumeSet{
+			smallLVSet,
+			overlappingLVSet,
+		}
+
+		// add pv and storageclass cleanup
+		addToCleanupFuncs(
+			cleanupFuncs,
+			"cleanupLVSetResources",
+			func(t *testing.T) error {
+				return cleanupLVSetResources(t, lvSets)
+			},
+		)
+
+		t.Logf("creating localvolumeset %q", smallLVSet.GetName())
 		err = f.Client.Create(context.TODO(), smallLVSet, &framework.CleanupOptions{TestContext: ctx})
 		matcher.Expect(err).NotTo(gomega.HaveOccurred(), "create localvolumeset")
 
-		eventuallyFindPVs(t, f, *smallLVSet, 2)
+		// look for 2 PVs
+		eventuallyFindPVs(t, f, smallLVSet.Spec.StorageClassName, 2)
 
 		// update lvset
 		matcher.Eventually(func() error {
@@ -151,11 +179,45 @@ func LocalVolumeSetTest(ctx *framework.Context, cleanupFuncs *[]cleanupFn) func(
 			return nil
 		}, time.Minute, time.Second*2).ShouldNot(gomega.HaveOccurred(), "updating lvset")
 
-		eventuallyFindPVs(t, f, *smallLVSet, 3)
+		// look for 3 PVs
+		eventuallyFindPVs(t, f, smallLVSet.Spec.StorageClassName, 3)
 
-		addToCleanupFuncs(cleanupFuncs, "cleanupLVSetResources", func(t *testing.T) error {
-			return cleanupLVSetResources(t, smallLVSet)
-		})
+		t.Logf("creating localvolumeset %q", overlappingLVSet.GetName())
+		err = f.Client.Create(context.TODO(), overlappingLVSet, &framework.CleanupOptions{TestContext: ctx})
+		matcher.Expect(err).NotTo(gomega.HaveOccurred(), "create localvolumeset")
+
+		// look for 1 PV
+		eventuallyFindPVs(t, f, overlappingLVSet.Spec.StorageClassName, 1)
+
+		// update overlapping lvset to match 2nd node
+		// nodeEnv[0].disks
+		// match and claim 1 disk from: 10
+		// nodeEnv[0].disks
+		// match and  claim 2 disks from: 10, 20, 30, 40
+		matcher.Eventually(func() error {
+			t.Log("updating lvset")
+			key := types.NamespacedName{Name: overlappingLVSet.GetName(), Namespace: overlappingLVSet.GetNamespace()}
+			err := f.Client.Get(context.TODO(), key, overlappingLVSet)
+			if err != nil {
+				t.Logf("error getting lvset %q: %+v", key, err)
+				return err
+			}
+
+			// update node selector
+			overlappingLVSet.Spec.NodeSelector.NodeSelectorTerms[0].MatchExpressions[0].Values = append(
+				overlappingLVSet.Spec.NodeSelector.NodeSelectorTerms[0].MatchExpressions[0].Values,
+				nodeEnv[1].node.ObjectMeta.Labels[corev1.LabelHostname],
+			)
+			err = f.Client.Update(context.TODO(), overlappingLVSet)
+			if err != nil {
+				t.Logf("error getting lvset %q: %+v", key, err)
+				return err
+			}
+			return nil
+		}, time.Minute, time.Second*2).ShouldNot(gomega.HaveOccurred(), "updating lvset")
+
+		// look for 3 PVs
+		eventuallyFindPVs(t, f, overlappingLVSet.Spec.StorageClassName, 3)
 
 	}
 
@@ -166,34 +228,32 @@ func LocalVolumeSetTest(ctx *framework.Context, cleanupFuncs *[]cleanupFn) func(
 // behaviour unverified for more than 15 disks per node.
 // it
 
-type nodeDisks struct {
-	disks []int
-	node  corev1.Node
-}
+func cleanupLVSetResources(t *testing.T, lvsets []*localv1alpha1.LocalVolumeSet) error {
+	for _, lvset := range lvsets {
 
-func cleanupLVSetResources(t *testing.T, lvset *localv1alpha1.LocalVolumeSet) error {
-	t.Log("cleaning up pvs and storageclasses")
-	f := framework.Global
-	matcher := gomega.NewWithT(t)
-	sc := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: lvset.Spec.StorageClassName}}
+		t.Logf("cleaning up pvs and storageclasses: %q", lvset.GetName())
+		f := framework.Global
+		matcher := gomega.NewWithT(t)
+		sc := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: lvset.Spec.StorageClassName}}
 
-	eventuallyDelete(t, lvset, lvset.GetName())
-	eventuallyDelete(t, sc, sc.GetName())
-	pvList := &corev1.PersistentVolumeList{}
-	t.Logf("listing pvs for lvset: %q", lvset.GetName())
-	matcher.Eventually(func() error {
-		err := f.Client.List(context.TODO(), pvList)
-		if err != nil {
-			return err
-		}
-		t.Logf("Deleting %d PVs", len(pvList.Items))
-		for _, pv := range pvList.Items {
-			if pv.Spec.StorageClassName == lvset.Spec.StorageClassName {
-				eventuallyDelete(t, &pv, pv.GetName())
+		eventuallyDelete(t, lvset, lvset.GetName())
+		eventuallyDelete(t, sc, sc.GetName())
+		pvList := &corev1.PersistentVolumeList{}
+		t.Logf("listing pvs for lvset: %q", lvset.GetName())
+		matcher.Eventually(func() error {
+			err := f.Client.List(context.TODO(), pvList)
+			if err != nil {
+				return err
 			}
-		}
-		return nil
-	}, time.Minute*2, time.Second*2).ShouldNot(gomega.HaveOccurred(), "cleaning up pvs for lvset: %q", lvset.GetName())
+			t.Logf("Deleting %d PVs", len(pvList.Items))
+			for _, pv := range pvList.Items {
+				if pv.Spec.StorageClassName == lvset.Spec.StorageClassName {
+					eventuallyDelete(t, &pv, pv.GetName())
+				}
+			}
+			return nil
+		}, time.Minute*3, time.Second*2).ShouldNot(gomega.HaveOccurred(), "cleaning up pvs for lvset: %q", lvset.GetName())
+	}
 
 	return nil
 }

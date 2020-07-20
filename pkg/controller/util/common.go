@@ -5,7 +5,7 @@ import "os"
 const (
 	defaultDiskMakerImageVersion = "quay.io/openshift/origin-local-storage-diskmaker"
 	defaultProvisionImage        = "quay.io/openshift/origin-local-storage-static-provisioner"
-	localDiskLocation            = "/mnt/local"
+	localDiskLocation            = "/mnt/local-storage"
 
 	ProvisionerServiceAccount    = "local-storage-admin"
 	ProvisionerPVRoleBindingName = "local-storage-provisioner-pv-binding"
@@ -13,9 +13,6 @@ const (
 
 	LocalVolumeSetRoleName        = "local-storage-provisioner-cr-role"
 	LocalVolumeSetRoleBindingName = "local-storage-provisioner-cr-rolebinding"
-
-	DefaultPVClusterRole           = "system:persistent-volume-provisioner"
-	ProvisionerNodeRoleBindingName = "local-storage-provisioner-node-binding"
 
 	OwnerNamespaceLabel = "local.storage.openshift.io/owner-namespace"
 	OwnerNameLabel      = "local.storage.openshift.io/owner-name"

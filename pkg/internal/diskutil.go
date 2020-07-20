@@ -9,9 +9,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 const (
@@ -19,6 +21,13 @@ const (
 	StateSuspended = "suspended"
 	// DiskByIDDir is the path for symlinks to the device by id.
 	DiskByIDDir = "/dev/disk/by-id/"
+)
+
+var (
+	// DefaultLockTimeout to use for WaitForPVCreationLock
+	DefaultLockTimeout = time.Second * 30
+	// DefaultLockInterval to use for
+	DefaultLockInterval = time.Second
 )
 
 // IDPathNotFoundError indicates that a symlink to the device was not found in /dev/disk/by-id/
@@ -34,6 +43,7 @@ func (e IDPathNotFoundError) Error() string {
 // All the fields are lsblk columns.
 type BlockDevice struct {
 	Name   string `json:"name"`
+	KName  string `json:"kname"`
 	Type   string `json:"type"`
 	Model  string `json:"mode,omitempty"`
 	Vendor string `json:"vendor,omitempty"`
@@ -96,18 +106,26 @@ func (b BlockDevice) GetSize() (int64, error) {
 
 // HasChildren check on BlockDevice
 func (b BlockDevice) HasChildren() (bool, error) {
-	sysDevDir := filepath.Join("/sys/block/", b.Name, "/*")
+	sysDevDir := filepath.Join("/sys/block/", b.KName, "/*")
 	paths, err := filepath.Glob(sysDevDir)
 	if err != nil {
 		return false, errors.Wrapf(err, "could not glob path: %q to verify partiions", sysDevDir)
 	}
 	for _, path := range paths {
 		name := filepath.Base(path)
-		if strings.HasPrefix(name, b.Name) {
+		if strings.HasPrefix(name, b.KName) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// GetDevPath for block device (/dev/sdx)
+func (b BlockDevice) GetDevPath() (string, error) {
+	if b.KName == "" {
+		return "", fmt.Errorf("empty KNAME")
+	}
+	return filepath.Join("/dev/", b.KName), nil
 }
 
 // GetPathByID check on BlockDevice
@@ -115,7 +133,7 @@ func (b BlockDevice) GetPathByID() (string, error) {
 
 	// return if previously populated value is valid
 	if len(b.pathByID) > 0 && strings.HasPrefix(b.pathByID, DiskByIDDir) {
-		evalsCorrectly, err := PathEvalsToDiskLabel(b.pathByID, b.Name)
+		evalsCorrectly, err := PathEvalsToDiskLabel(b.pathByID, b.KName)
 		if err == nil && evalsCorrectly {
 			return b.pathByID, nil
 		}
@@ -127,7 +145,7 @@ func (b BlockDevice) GetPathByID() (string, error) {
 		return "", fmt.Errorf("could not list files in %q: %w", DiskByIDDir, err)
 	}
 	for _, path := range paths {
-		isMatch, err := PathEvalsToDiskLabel(path, b.Name)
+		isMatch, err := PathEvalsToDiskLabel(path, b.KName)
 		if err != nil {
 			return "", err
 		}
@@ -136,8 +154,12 @@ func (b BlockDevice) GetPathByID() (string, error) {
 			return path, nil
 		}
 	}
+	devPath, err := b.GetDevPath()
+	if err != nil {
+		return "", err
+	}
 	// return path by label and error
-	return fmt.Sprintf("/dev/%s", b.Name), IDPathNotFoundError{DeviceName: b.Name}
+	return devPath, IDPathNotFoundError{DeviceName: b.KName}
 }
 
 // PathEvalsToDiskLabel checks if the path is a symplink to a file devName
@@ -160,7 +182,7 @@ func ListBlockDevices() ([]BlockDevice, []string, error) {
 	var output bytes.Buffer
 	var blockDevices []BlockDevice
 
-	columns := "NAME,ROTA,TYPE,SIZE,MODEL,VENDOR,RO,RM,STATE,FSTYPE"
+	columns := "NAME,ROTA,TYPE,SIZE,MODEL,VENDOR,RO,RM,STATE,FSTYPE,KNAME"
 	args := []string{"--pairs", "-b", "-o", columns}
 	cmd := exec.Command("lsblk", args...)
 	cmd.Stdout = &output
@@ -173,10 +195,9 @@ func ListBlockDevices() ([]BlockDevice, []string, error) {
 	// convert to json and then Marshal.
 	outputMapList := make([]map[string]interface{}, 0)
 	rowList := strings.Split(output.String(), "\n")
-RowLoop:
 	for _, row := range rowList {
 		if len(strings.Trim(row, " ")) == 0 {
-			break RowLoop
+			break
 		}
 		outputMap := make(map[string]interface{})
 		// split by `" ` to avoid splitting on spaces in MODEL,VENDOR
@@ -195,12 +216,12 @@ RowLoop:
 		v, found := outputMap["name"]
 		if !found {
 			badRows = append(badRows, row)
-			break RowLoop
+			break
 		}
 		name := v.(string)
 		if len(strings.Trim(name, " ")) == 0 {
 			badRows = append(badRows, row)
-			break RowLoop
+			break
 		}
 		outputMapList = append(outputMapList, outputMap)
 	}
@@ -222,41 +243,69 @@ RowLoop:
 	return blockDevices, badRows, nil
 }
 
-// PVCreationLock checks whether a PV can be created based on this device
+// GetPVCreationLock checks whether a PV can be created based on this device
 // and Locks the device so that no PVs can be created on it while the lock is held.
 // the PV lock will fail if:
 // - another process holds an exclusive file lock on the device (using the syscall flock)
 // - a symlink to this device exists in symlinkDirs
 // returns:
-// ExclusiveFileLock, must be unlocked
+// ExclusiveFileLock, must be unlocked regardless of success
 // bool determines if flock was placed on device.
+// existingLinkPaths is a list of existing symlinks. It is not exhaustive
 // error
-func PVCreationLock(device string, symlinkDirs ...string) (ExclusiveFileLock, bool, error) {
+func GetPVCreationLock(device string, symlinkDirs ...string) (ExclusiveFileLock, bool, []string, error) {
 	lock := ExclusiveFileLock{Path: device}
 	locked, err := lock.Lock()
 	if err != nil || !locked {
-		return lock, false, err
+		return lock, false, []string{}, err
 	}
-
-	for _, dir := range symlinkDirs {
-		links, err := GetMatchingSymlinksInDir(dir, device)
-		// return false if symlinks exist
-		if err != nil || len(links) > 0 {
-			return lock, false, err
-		}
+	existingLinkPaths, err := GetMatchingSymlinksInDirs(device, symlinkDirs...)
+	if err != nil || len(existingLinkPaths) > 0 {
+		return lock, false, existingLinkPaths, err
 	}
-	return lock, true, nil
+	return lock, true, existingLinkPaths, nil
 }
 
-// GetMatchingSymlinksInDir returns all the files in dir that are the same file as path after evaluating symlinks
-// it works using `find -L dir -samefile path`
-func GetMatchingSymlinksInDir(dir, path string) ([]string, error) {
-	cmd := exec.Command("find", "-L", dir, "-samefile", path)
+// WaitForPVCreationLock runs GetPVCreationLock until:
+// the timeout is reached, an existing symlink is detected, or the lock is acquired.
+func WaitForPVCreationLock(interval, timeout time.Duration, device string, symlinkDirs ...string) (ExclusiveFileLock, bool, []string, error) {
+	var lock ExclusiveFileLock
+	var locked bool
+	var existingSymlinks []string
+	err := wait.Poll(interval, timeout, func() (bool, error) {
+		var err error
+		lock, locked, existingSymlinks, err = GetPVCreationLock(device, symlinkDirs...)
+		if err != nil {
+			return false, err
+		} else if !locked {
+			return false, nil
+		}
+		return true, nil
+	})
+	return lock, locked, existingSymlinks, err
+}
+
+// GetMatchingSymlinksInDirs returns all the files in dir that are the same file as path after evaluating symlinks
+// it works using `find -L dir1 dir2 dirn -samefile path`
+func GetMatchingSymlinksInDirs(path string, dirs ...string) ([]string, error) {
+	cmd := exec.Command("find", "-L", strings.Join(dirs, " "), "-samefile", path)
 	output, err := executeCmd(cmd)
 	if err != nil {
-		return []string{}, fmt.Errorf("failed to get symlinks in directory %q for device ID %q. %v", dir, path, err)
+		return []string{}, fmt.Errorf("failed to get symlinks in directories: %q for device path %q. %v", dirs, path, err)
 	}
-	return strings.Split(strings.TrimSuffix(output, "\n"), "\n"), nil
+	links := make([]string, 0)
+	output = strings.Trim(output, " \n")
+	if len(output) < 1 {
+		return links, nil
+	}
+	split := strings.Split(output, "\n")
+	for _, entry := range split {
+		link := strings.Trim(entry, " ")
+		if len(link) != 0 {
+			links = append(links, link)
+		}
+	}
+	return links, nil
 }
 
 func executeCmd(cmd *exec.Cmd) (string, error) {
@@ -279,6 +328,23 @@ type ExclusiveFileLock struct {
 
 // Lock locks the file so other process cannot open the file
 func (e *ExclusiveFileLock) Lock() (bool, error) {
+	// fd, errno := unix.Open(e.Path, unix.O_RDONLY, 0)
+	fd, errno := unix.Open(e.Path, unix.O_RDONLY|unix.O_EXCL, 0)
+	e.fd = fd
+	if errno == unix.EBUSY {
+		e.locked = false
+		// device is in use
+		return false, nil
+	} else if errno != nil {
+		return false, errno
+	}
+	e.locked = true
+	return e.locked, nil
+
+}
+
+// FLock locks the file so other process cannot open the file
+func (e *ExclusiveFileLock) FLock() (bool, error) {
 	fd, errno := unix.Open(e.Path, unix.O_RDONLY|unix.O_EXCL, 0)
 	e.fd = fd
 
@@ -300,10 +366,15 @@ func (e *ExclusiveFileLock) Lock() (bool, error) {
 	return e.locked, nil
 }
 
-// Unlock releases the lock
+// Unlock releases the lock. It is idempotent
 func (e *ExclusiveFileLock) Unlock() error {
 	if e.locked {
-		return unix.Close(e.fd)
+		err := unix.Close(e.fd)
+		if err == nil {
+			e.locked = false
+			return nil
+		}
+		return fmt.Errorf("failed to unlock fd %q: %+v", e.fd, err)
 	}
 	return nil
 

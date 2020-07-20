@@ -1,7 +1,6 @@
 package lvset
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 
@@ -59,10 +58,8 @@ var filterMap = map[string]func(internal.BlockDevice, localv1alpha1.DeviceInclus
 		return !hasChildren, err
 	},
 	canOpenExclusively: func(dev internal.BlockDevice, spec localv1alpha1.DeviceInclusionSpec) (bool, error) {
-		pathname, err := dev.GetPathByID()
-		if errors.As(err, &internal.IDPathNotFoundError{}) {
-			log.Info(fmt.Sprintf("%v: using /dev/%s", err, dev.Name))
-		} else if err != nil {
+		pathname, err := dev.GetDevPath()
+		if err != nil {
 			return false, fmt.Errorf("pathname: %q: %w", pathname, err)
 		}
 		fd, errno := unix.Open(pathname, unix.O_RDONLY|unix.O_EXCL, 0)

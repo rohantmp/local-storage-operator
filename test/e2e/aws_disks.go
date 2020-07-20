@@ -22,6 +22,11 @@ const (
 	awsPurposeTag = "localvolumeset-functest"
 )
 
+type nodeDisks struct {
+	disks []int
+	node  corev1.Node
+}
+
 // this assumes that the device spaces /dev/sd[h-z] are available on the node
 // do not provide more than 20 disksizes
 // do not use more than once per node
