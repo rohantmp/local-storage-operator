@@ -25,8 +25,8 @@ func (r *DaemonReconciler) aggregateDeamonInfo(request reconcile.Request) (local
 
 	lvSets := lvSetList.Items
 	tolerations, ownerRefs, terms := extractLVSetInfo(lvSets)
-	var nodeSelector *corev1.NodeSelector
-	if len(terms) > 1 {
+	var nodeSelector *corev1.NodeSelector = nil
+	if len(terms) > 0 {
 		nodeSelector = &corev1.NodeSelector{NodeSelectorTerms: terms}
 	}
 
@@ -58,17 +58,16 @@ func extractLVSetInfo(lvsets []localv1alpha1.LocalVolumeSet) ([]corev1.Toleratio
 			Controller:         &falseVar,
 			BlockOwnerDeletion: &falseVar,
 		})
-
-		if !matchAllNodes {
-			selector := lvset.Spec.NodeSelector
-			if selector != nil { // append to term if !nil and !matchAllNodes
-				terms = append(terms, selector.NodeSelectorTerms...)
-			} else { // set matchAllNodes and empty terms
-				matchAllNodes = true
-				terms = make([]corev1.NodeSelectorTerm, 0)
-			}
+		if lvset.Spec.NodeSelector != nil {
+			terms = append(terms, lvset.Spec.NodeSelector.NodeSelectorTerms...)
+		} else {
+			matchAllNodes = true
 		}
 
+	}
+	if matchAllNodes {
+		fmt.Printf("AZF: matchAllNodes")
+		terms = make([]corev1.NodeSelectorTerm, 0)
 	}
 
 	return tolerations, ownerRefs, terms

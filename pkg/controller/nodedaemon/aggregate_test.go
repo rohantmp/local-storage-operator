@@ -182,5 +182,15 @@ func TestExtractLVSetInfoWithNilNodeSelector(t *testing.T) {
 		assert.Len(t, terms, 0)
 
 	}
+	for i := 0; i <= count; i++ {
+		lvSets := []localv1alpha1.LocalVolumeSet{}
+		for j := 0; j <= count; j++ {
+			lvSets = append(lvSets, lvSetWithNodeSelector)
+		}
+		_, _, terms := extractLVSetInfo(lvSets)
+		// empty nodeSelector in any spot should result in empty terms
+		assert.Len(t, terms, len(lvSets)*2)
+
+	}
 
 }
