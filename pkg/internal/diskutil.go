@@ -47,7 +47,7 @@ type BlockDevice struct {
 	Model  string `json:"mode,omitempty"`
 	Vendor string `json:"vendor,omitempty"`
 	State  string `json:"state,omitempty"`
-	FSType string `json:"fstype"`
+	FSType string `json:"fsType"`
 	Size   string `json:"size"`
 	// Children   []BlockDevice `json:"children,omitempty"`
 	Rotational string `json:"rota"`
