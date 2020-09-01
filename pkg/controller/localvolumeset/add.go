@@ -65,17 +65,27 @@ func AddLocalVolumeSetReconciler(mgr manager.Manager) error {
 	//  watch for storageclass, enqueue owner
 	err = c.Watch(&source.Kind{Type: &corev1.PersistentVolume{}}, &handler.EnqueueRequestsFromMapFunc{
 		ToRequests: handler.ToRequestsFunc(func(obj handler.MapObject) []reconcile.Request {
-			pv, ok := obj.Object.(*corev1.PersistentVolume)
+			_, ok := obj.Object.(*corev1.PersistentVolume)
 			if !ok {
 				return []reconcile.Request{}
 			}
-
-			names := lvSetMap.GetStorageClassOwners(pv.Spec.StorageClassName)
-			reqs := make([]reconcile.Request, 0)
-			for _, name := range names {
-				reqs = append(reqs, reconcile.Request{NamespacedName: name})
+			labels := obj.Meta.GetLabels()
+			kind, found := labels[common.PVOwnerKindLabel]
+			if !found || kind != localv1alpha1.LocalVolumeSetKind {
+				return []reconcile.Request{}
 			}
-			return reqs
+			namespace, found := labels[common.PVOwnerNamespaceLabel]
+			if !found {
+				return []reconcile.Request{}
+			}
+			name, found := labels[common.PVOwnerNameLabel]
+			if !found {
+				return []reconcile.Request{}
+			}
+			req := reconcile.Request{
+				NamespacedName: types.NamespacedName{Namespace: namespace, Name: name},
+			}
+			return []reconcile.Request{req}
 		}),
 	})
 	if err != nil {

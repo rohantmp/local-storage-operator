@@ -2,6 +2,8 @@ package localvolumeset
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	localv1alpha1 "github.com/openshift/local-storage-operator/pkg/apis/local/v1alpha1"
@@ -20,6 +22,7 @@ import (
 const (
 	LocalVolumeSetNameLabel      = "local.storage.openshift.io/localvolumeset-owner-name"
 	LocalVolumeSetNamespaceLabel = "local.storage.openshift.io/localvolumeset-owner-namespace"
+	requeueDuration              = time.Minute
 )
 
 // blank assignment to verify that ReconcileLocalVolumeSet implements reconcile.Reconciler
@@ -66,6 +69,11 @@ func (r *LocalVolumeSetReconciler) reconcile(request reconcile.Request) (reconci
 
 	// store a one to many association from storageClass to LocalVolumeSet
 	r.lvSetMap.RegisterStorageClassOwner(lvSet.Spec.StorageClassName, request.NamespacedName)
+
+	err = r.syncFinalizer(*lvSet)
+	if err != nil {
+		return reconcile.Result{}, fmt.Errorf("failed to update localvolumeset finalizer: %w", err)
+	}
 
 	// The diskmaker daemonset, local-staic-provisioner daemonset and configmap are created in pkg/daemon
 	// this way, there can be one daemonset for all LocalVolumeSets
