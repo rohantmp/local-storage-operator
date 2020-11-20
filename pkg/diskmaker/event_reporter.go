@@ -15,7 +15,7 @@ const (
 	ErrorReadingBlockList    = "ErrorReadingBlockList"
 	ErrorListingDeviceID     = "ErrorListingDeviceID"
 	ErrorFindingMatchingDisk = "ErrorFindingMatchingDisk"
-	ErrorCreatingSymLink     = "ErrorCreatingSymLink"
+	ErrorProvisioningDisk    = "ErrorProvisioningDisk"
 
 	FoundMatchingDisk   = "FoundMatchingDisk"
 	DeviceSymlinkExists = "DeviceSymlinkExists"
