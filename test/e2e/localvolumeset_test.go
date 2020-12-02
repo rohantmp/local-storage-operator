@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/onsi/gomega"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -15,6 +16,8 @@ import (
 
 	localv1 "github.com/openshift/local-storage-operator/pkg/apis/local/v1"
 	localv1alpha1 "github.com/openshift/local-storage-operator/pkg/apis/local/v1alpha1"
+	"github.com/openshift/local-storage-operator/pkg/common"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,6 +25,7 @@ import (
 
 const (
 	labelNodeRoleWorker = "node-role.kubernetes.io/worker"
+	pvConsumerLabel     = "pv-consumer"
 )
 
 func LocalVolumeSetTest(ctx *framework.Context, cleanupFuncs *[]cleanupFn) func(*testing.T) {
@@ -297,10 +301,203 @@ func LocalVolumeSetTest(ctx *framework.Context, cleanupFuncs *[]cleanupFn) func(
 			}
 			return nil
 		}, time.Minute, time.Second*2).ShouldNot(gomega.HaveOccurred(), "updating lvset")
-		eventuallyFindPVs(t, f, twentyToFiftyFilesystem.Spec.StorageClassName, 9)
+		pvList := eventuallyFindPVs(t, f, twentyToFiftyFilesystem.Spec.StorageClassName, 9)
+		_ = pvList
+		// verifyReclaimPolicyDelete
+
+		verifyRecliamPolicyDelete(t, f, ctx, twentyToFiftyFilesystem.Spec.StorageClassName, pvList)
 
 	}
 
+}
+
+func verifyRecliamPolicyDelete(t *testing.T, f *framework.Framework, ctx *framework.Context, storageClassName string, pvList []corev1.PersistentVolume) {
+	matcher := gomega.NewGomegaWithT(t)
+
+	jobList := make([]batchv1.Job, 0)
+	for _, pv := range pvList {
+		job, _ := claimAndReleasePV(t, f, ctx, pv)
+		jobList = append(jobList, job)
+	}
+	matcher.Eventually(func() bool {
+		var err error
+		for _, existingJobs := range jobList {
+			job := &batchv1.Job{}
+			err = f.Client.Get(context.TODO(), types.NamespacedName{Name: existingJobs.Name, Namespace: existingJobs.Namespace}, job)
+			if err != nil {
+				t.Logf("failed to get job: %q", existingJobs.Name)
+				return false
+			}
+			if job.Status.CompletionTime != nil {
+				return false
+			} else {
+				eventuallyDelete(t, job, job.Name)
+			}
+		}
+		return true
+	}, time.Minute*2, time.Second*2).Should(gomega.BeTrue(), "waiting for all pv-consumer jobs to be completed")
+
+	matcher.Eventually(func() error {
+		job := &batchv1.Job{}
+		err := f.Client.DeleteAllOf(context.TODO(), job, &client.MatchingLabels{"app": pvConsumerLabel})
+		return err
+	}).ShouldNot(gomega.HaveOccurred(), "deleting pv-consumer jobs")
+
+	var foundCount int
+	matcher.Eventually(func() bool {
+		var err error
+		foundCount = 0
+		for _, existingPV := range pvList {
+			pv := &corev1.PersistentVolume{}
+			err = f.Client.Get(context.TODO(), types.NamespacedName{Name: existingPV.Name, Namespace: existingPV.Namespace}, pv)
+			if errors.IsNotFound(err) {
+				continue
+			} else if err != nil {
+				t.Logf("failed to get pv: %q", pv.Name)
+				continue
+			}
+			if existingPV.UID == pv.UID {
+				// the PV has not been deleted yet
+				continue
+			}
+			foundCount++
+		}
+		if foundCount == len(pvList) {
+			return true
+		}
+		return false
+	}, time.Minute*3, time.Second*2).Should(gomega.BeTrue(), "waiting for all the pvs to be recreated")
+
+	// list n
+	// consume n PVs
+	// wait for Bound Phase
+	// write something
+	// release
+	// verify uuid deletion
+	// verify PV is replaced with same name
+	// attempt to read something?
+
+}
+
+func claimAndReleasePV(t *testing.T, f *framework.Framework, ctx *framework.Context, pv corev1.PersistentVolume) (batchv1.Job, corev1.PersistentVolumeClaim) {
+	claimName := fmt.Sprintf("%s-consumer", pv.Name)
+	capacity, found := pv.Spec.Capacity[corev1.ResourceStorage]
+	if !found {
+		t.Fatalf("storage capacity not found in pv: %q", pv.Name)
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      claimName,
+			Namespace: f.Namespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			StorageClassName: &pv.Spec.StorageClassName,
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			VolumeMode:       pv.Spec.VolumeMode,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: capacity,
+				},
+			},
+		},
+	}
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      claimName,
+			Namespace: f.Namespace,
+			Labels: map[string]string{
+				"app": pvConsumerLabel,
+			},
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					Containers: []corev1.Container{
+						{
+							Name:  "data-writer",
+							Image: common.GetDiskMakerImage(),
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									MountPath: "/data",
+									Name:      "volume-to-debug",
+								},
+							},
+							Command: []string{"/bin/sh", "-c"},
+							Args: []string{
+								"set -x",
+								"dd if=/dev/zero of=/tmp/random.img bs=512 count=1",       // create a new file named random.img
+								"md5VAR1=$(md5sum /tmp/random.img | awk '{ print $1 }')",  // get md5 hash
+								"cp /tmp/random.img /data/random.img",                     // copy random.img file to pvc mountpoint
+								"md5VAR2=$(md5sum /data/random.img | awk '{ print $1 }')", // calculate md5sum in new location
+								"if [[ \"$md5VAR1\" != \"$md5VAR2\" ]];then exit 1; fi;",  // compare the two
+								"sync;", // ensure write
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "volume-to-debug",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: claimName,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	started := metav1.NewTime(time.Now())
+	matcher := gomega.NewGomegaWithT(t)
+	matcher.Eventually(func() error {
+		t.Logf("creating job and pvc to consume pv %q with volumeMode %q", pv.Name, *pv.Spec.VolumeMode)
+		// create pvc
+		err := f.Client.Create(context.TODO(), pvc, &framework.CleanupOptions{TestContext: ctx})
+		if errors.IsAlreadyExists(err) {
+			// get existing
+			err = f.Client.Get(
+				context.TODO(),
+				types.NamespacedName{Name: pvc.GetName(), Namespace: pvc.GetNamespace()},
+				job,
+			)
+			if err != nil {
+				return err
+			}
+			// delete it if it stale one exists
+			if job.CreationTimestamp.Before(&started) {
+				eventuallyDelete(t, pvc, fmt.Sprintf("existing %v", pvc.GetName()))
+				// restart
+				return fmt.Errorf("stale pvc exists")
+			}
+		} else if err != nil {
+			return err
+		}
+
+		// create job
+		err = f.Client.Create(context.TODO(), job, &framework.CleanupOptions{TestContext: ctx})
+		if errors.IsAlreadyExists(err) {
+			// get existing
+			err = f.Client.Get(
+				context.TODO(),
+				types.NamespacedName{Name: job.GetName(), Namespace: job.GetNamespace()},
+				job,
+			)
+			if err != nil {
+				return err
+			}
+			// delete it if it stale one exists exists
+			if job.CreationTimestamp.Before(&started) {
+				eventuallyDelete(t, job, fmt.Sprintf("existing %v", job.GetName()))
+				// restart
+				return fmt.Errorf("stale job existes")
+			}
+		}
+		return err
+	}).ShouldNot(gomega.HaveOccurred(), "creating job and pv")
+	return *job, *pvc
 }
 
 func cleanupLVSetResources(t *testing.T, lvsets []*localv1alpha1.LocalVolumeSet) error {
