@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"context"
 	goctx "context"
 	"fmt"
 	"os"
@@ -9,10 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/onsi/gomega"
 	operatorv1 "github.com/openshift/api/operator/v1"
 	localv1 "github.com/openshift/local-storage-operator/pkg/apis/local/v1"
 	commontypes "github.com/openshift/local-storage-operator/pkg/common"
 	framework "github.com/operator-framework/operator-sdk/pkg/test"
+	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,6 +24,7 @@ import (
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	dynclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -36,7 +40,58 @@ func LocalVolumeTest(ctx *framework.Context, cleanupFuncs *[]cleanupFn) func(*te
 		if err != nil {
 			t.Fatalf("error fetching namespace : %v", err)
 		}
-		selectedNode := selectNode(t, f.KubeClient)
+
+		matcher := gomega.NewGomegaWithT(t)
+		gomega.SetDefaultEventuallyTimeout(time.Minute * 10)
+		gomega.SetDefaultEventuallyPollingInterval(time.Second * 2)
+
+		// get nodes
+		nodeList := &corev1.NodeList{}
+		err = f.Client.List(context.TODO(), nodeList, client.HasLabels{labelNodeRoleWorker})
+		if err != nil {
+			t.Fatalf("failed to list nodes: %+v", err)
+		}
+
+		minNodes := 1
+		if len(nodeList.Items) < minNodes {
+			t.Fatalf("expected to have at least %d nodes", minNodes)
+		}
+
+		// represents the disk layout to setup on the nodes.
+		nodeEnv := []nodeDisks{
+			{
+				disks: []int{10, 20, 30},
+				node:  nodeList.Items[0],
+			},
+		}
+
+		selectedNode := nodeEnv[0].node
+
+		t.Log("getting AWS region info from node spec")
+		_, region, _, err := getAWSNodeInfo(nodeList.Items[0])
+		matcher.Expect(err).NotTo(gomega.HaveOccurred(), "getAWSNodeInfo")
+
+		// initialize client
+		t.Log("initialize ec2 creds")
+		ec2Client, err := getEC2Client(region)
+		matcher.Expect(err).NotTo(gomega.HaveOccurred(), "getEC2Client")
+
+		// cleanup host dirs
+
+		addToCleanupFuncs(cleanupFuncs, "cleanupSymlinkDir", func(t *testing.T) error {
+			return cleanupSymlinkDir(t, ctx, nodeEnv)
+		})
+		// register disk cleanup
+		addToCleanupFuncs(cleanupFuncs, "cleanupAWSDisks", func(t *testing.T) error {
+			return cleanupAWSDisks(t, ec2Client)
+		})
+
+		// create and attach volumes
+		t.Log("creating and attaching disks")
+		for _, nodeDisks := range nodeEnv {
+			_, err := createAndAttachAWSVolumes(t, ec2Client, ctx, namespace, nodeDisks.node, nodeDisks.disks...)
+			matcher.Expect(err).NotTo(gomega.HaveOccurred(), "createAndAttachAWSVolumes: %+v", nodeDisks)
+		}
 
 		originalNodeTaints := selectedNode.Spec.Taints
 		selectedNode.Spec.Taints = []v1.Taint{
