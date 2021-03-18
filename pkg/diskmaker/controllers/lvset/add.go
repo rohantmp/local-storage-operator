@@ -36,9 +36,16 @@ const (
 )
 
 var log = logf.Log.WithName(ComponentName)
+var watchNamespace string
+var nodeName string
+
+func init() {
+	nodeName = common.GetNodeNameEnvVar()
+	watchNamespace = common.GetWatchNameSpaceEnfVar()
+}
 
 // Add adds a new nodeside lvset controller to mgr
-func Add(mgr manager.Manager) error {
+func Add(mgr manager.Manager, cleanupTracker *provDeleter.CleanupStatusTracker, pvCache *provCache.VolumeCache) error {
 
 	clientSet := provCommon.SetupClient()
 
@@ -46,7 +53,7 @@ func Add(mgr manager.Manager) error {
 		UserConfig: &provCommon.UserConfig{
 			Node: &corev1.Node{},
 		},
-		Cache:    provCache.NewVolumeCache(),
+		Cache:    pvCache,
 		VolUtil:  provUtil.NewVolumeUtil(),
 		APIUtil:  provUtil.NewAPIUtil(clientSet),
 		Client:   clientSet,
@@ -55,13 +62,11 @@ func Add(mgr manager.Manager) error {
 		// InformerFactory: , // unused
 
 	}
-	cleanupTracker := &provDeleter.CleanupStatusTracker{ProcTable: provDeleter.NewProcTable()}
 	clock := &wallTime{}
 	crClient := mgr.GetClient()
 	r := &ReconcileLocalVolumeSet{
 		client:         crClient,
 		scheme:         mgr.GetScheme(),
-		nodeName:       getNodeNameEnvVar(),
 		eventReporter:  newEventReporter(mgr.GetEventRecorderFor(ComponentName)),
 		deviceAgeMap:   newAgeMap(clock),
 		cleanupTracker: cleanupTracker,
@@ -128,17 +133,11 @@ func Add(mgr manager.Manager) error {
 }
 
 func handlePVChange(runtimeConfig *provCommon.RuntimeConfig, pv *corev1.PersistentVolume, q workqueue.RateLimitingInterface, isDelete bool) {
-	// skip non-owned PVs
-	name, found := pv.Annotations[provCommon.AnnProvisionedBy]
-	if !found || name != runtimeConfig.Name {
-		return
-	}
 
-	// update cache
-	if isDelete {
-		removePV(runtimeConfig, *pv)
-	} else {
-		addOrUpdatePV(runtimeConfig, *pv)
+	// skip non-owned PVs unless provisioner name is not yet known
+	name, found := pv.Annotations[provCommon.AnnProvisionedBy]
+	if runtimeConfig.Name != "" && (!found || name != runtimeConfig.Name) {
+		return
 	}
 
 	// enqueue owner
@@ -150,11 +149,19 @@ func handlePVChange(runtimeConfig *provCommon.RuntimeConfig, pv *corev1.Persiste
 	if !found {
 		return
 	}
-	q.Add(reconcile.Request{NamespacedName: types.NamespacedName{Name: ownerName, Namespace: ownerNamespace}})
+
+	ownerKind, found := pv.Labels[common.PVOwnerKindLabel]
+	if ownerKind != localv1alpha1.LocalVolumeSetKind || !found {
+		return
+	}
 	if isDelete {
+		// delayed reconcile so that the cleanup tracker has time to mark the PV cleaned up
 		time.Sleep(time.Second * 10)
 		q.Add(reconcile.Request{NamespacedName: types.NamespacedName{Name: ownerName, Namespace: ownerNamespace}})
+	} else {
+		q.Add(reconcile.Request{NamespacedName: types.NamespacedName{Name: ownerName, Namespace: ownerNamespace}})
 	}
+
 }
 
 // blank assignment to verify that ReconcileLocalVolumeSet implements reconcile.Reconciler
@@ -166,7 +173,6 @@ type ReconcileLocalVolumeSet struct {
 	client        client.Client
 	scheme        *runtime.Scheme
 	eventReporter *eventReporter
-	nodeName      string
 	// map from KNAME of device to time when the device was first observed since the process started
 	deviceAgeMap *ageMap
 
@@ -174,7 +180,6 @@ type ReconcileLocalVolumeSet struct {
 	cleanupTracker *provDeleter.CleanupStatusTracker
 	runtimeConfig  *provCommon.RuntimeConfig
 	deleter        *provDeleter.Deleter
-	firstRunOver   bool
 }
 
 var _ reconcile.Reconciler = &ReconcileLocalVolumeSet{}
