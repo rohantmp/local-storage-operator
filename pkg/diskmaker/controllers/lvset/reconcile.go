@@ -76,6 +76,9 @@ func (r *ReconcileLocalVolumeSet) Reconcile(request reconcile.Request) (reconcil
 		return reconcile.Result{}, err
 	}
 
+	r.provisionerMux.Lock()
+	defer r.provisionerMux.Unlock()
+
 	// get associated provisioner config
 	cm := &corev1.ConfigMap{}
 	err = r.client.Get(context.TODO(), types.NamespacedName{Name: common.ProvisionerConfigMapName, Namespace: request.Namespace}, cm)
@@ -90,14 +93,19 @@ func (r *ReconcileLocalVolumeSet) Reconcile(request reconcile.Request) (reconcil
 
 	r.runtimeConfig.DiscoveryMap = provisionerConfig.StorageClassConfig
 	r.runtimeConfig.NodeLabelsForPV = provisionerConfig.NodeLabelsForPV
-	r.runtimeConfig.UseAlphaAPI = provisionerConfig.UseAlphaAPI
-	r.runtimeConfig.UseJobForCleaning = provisionerConfig.UseJobForCleaning
-	r.runtimeConfig.MinResyncPeriod = provisionerConfig.MinResyncPeriod
-	r.runtimeConfig.UseNodeNameOnly = provisionerConfig.UseNodeNameOnly
 	r.runtimeConfig.Namespace = request.Namespace
-	r.runtimeConfig.LabelsForPV = provisionerConfig.LabelsForPV
 	r.runtimeConfig.SetPVOwnerRef = provisionerConfig.SetPVOwnerRef
-	r.runtimeConfig.Name = getProvisionedByValue(*r.runtimeConfig.Node)
+	r.runtimeConfig.Name = common.GetProvisionedByValue(*r.runtimeConfig.Node)
+
+	// ignored by our implementation of static-provisioner,
+	// but not by deleter (if applicable)
+	r.runtimeConfig.UseNodeNameOnly = provisionerConfig.UseNodeNameOnly
+	r.runtimeConfig.MinResyncPeriod = provisionerConfig.MinResyncPeriod
+	r.runtimeConfig.UseAlphaAPI = provisionerConfig.UseAlphaAPI
+	r.runtimeConfig.LabelsForPV = provisionerConfig.LabelsForPV
+
+	// unsupported
+	r.runtimeConfig.UseJobForCleaning = false
 
 	// initialize the deleter's pv cache on the first run
 	if !r.firstRunOver {
@@ -198,8 +206,6 @@ func (r *ReconcileLocalVolumeSet) Reconcile(request reconcile.Request) (reconcil
 	if len(noMatch) > 0 {
 		reqLogger.Info("found stale symLink Entries", "storageClass.Name", storageClassName, "paths.List", noMatch, "directory", symLinkDir)
 	}
-
-	r.deleter.DeletePVs()
 
 	// shorten the requeueTime if there are delayed devices
 	requeueTime := time.Minute

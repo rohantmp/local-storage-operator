@@ -15,6 +15,7 @@ import (
 	"github.com/openshift/local-storage-operator/pkg/internal"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	staticProvisioner "sigs.k8s.io/sig-storage-local-static-provisioner/pkg/common"
 
 	localv1 "github.com/openshift/local-storage-operator/pkg/apis/local/v1"
 
@@ -58,6 +59,9 @@ func (r *ReconcileLocalVolume) createSymLink(deviceNameLocation DiskLocation, sy
 		symLinkTarget = getSymlinkTarget(deviceNameLocation.diskNamePath, symLinkDirPath)
 		isSymLinkedByDeviceName = true
 	}
+
+	// TODO: check if the existingSymlink is to our symlinkTarget, if it is,
+	// then skip symlink creation and continue to create PV
 
 	// get PV creation lock which checks for existing symlinks to this device
 	pvLock, pvLocked, existingSymlinks, err := internal.GetPVCreationLock(
@@ -186,13 +190,14 @@ func (r *ReconcileLocalVolume) Reconcile(request reconcile.Request) (reconcile.R
 
 	// ignore LocalVolumes whose LabelSelector doesn't match this node
 	// NodeSelectorTerms.MatchExpressions are ORed
-	node := &corev1.Node{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: os.Getenv("MY_NODE_NAME")}, node)
+
+	r.runtimeConfig.Node = &corev1.Node{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: os.Getenv("MY_NODE_NAME")}, r.runtimeConfig.Node)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 
-	matches, err := common.NodeSelectorMatchesNodeLabels(node, lv.Spec.NodeSelector)
+	matches, err := common.NodeSelectorMatchesNodeLabels(r.runtimeConfig.Node, lv.Spec.NodeSelector)
 	if err != nil {
 		reqLogger.Error(err, "failed to match nodeSelector to node labels")
 		return reconcile.Result{}, err
@@ -201,6 +206,34 @@ func (r *ReconcileLocalVolume) Reconcile(request reconcile.Request) (reconcile.R
 	if !matches {
 		return reconcile.Result{}, nil
 	}
+
+	// get associated provisioner config
+	cm := &corev1.ConfigMap{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: common.ProvisionerConfigMapName, Namespace: request.Namespace}, cm)
+	if err != nil {
+		reqLogger.Error(err, "could not get provisioner configmap")
+		return reconcile.Result{}, err
+	}
+
+	// read provisioner config
+	provisionerConfig := staticProvisioner.ProvisionerConfiguration{}
+	staticProvisioner.ConfigMapDataToVolumeConfig(cm.Data, &provisionerConfig)
+
+	r.runtimeConfig.DiscoveryMap = provisionerConfig.StorageClassConfig
+	r.runtimeConfig.NodeLabelsForPV = provisionerConfig.NodeLabelsForPV
+	r.runtimeConfig.Namespace = request.Namespace
+	r.runtimeConfig.SetPVOwnerRef = provisionerConfig.SetPVOwnerRef
+	r.runtimeConfig.Name = common.GetProvisionedByValue(*r.runtimeConfig.Node)
+
+	// ignored by our implementation of static-provisioner,
+	// but not by deleter (if applicable)
+	r.runtimeConfig.UseNodeNameOnly = provisionerConfig.UseNodeNameOnly
+	r.runtimeConfig.MinResyncPeriod = provisionerConfig.MinResyncPeriod
+	r.runtimeConfig.UseAlphaAPI = provisionerConfig.UseAlphaAPI
+	r.runtimeConfig.LabelsForPV = provisionerConfig.LabelsForPV
+
+	// unsupported
+	r.runtimeConfig.UseJobForCleaning = false
 
 	err = os.MkdirAll(r.symlinkLocation, 0755)
 	if err != nil {

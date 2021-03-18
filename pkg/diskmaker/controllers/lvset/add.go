@@ -2,7 +2,7 @@ package lvset
 
 import (
 	"fmt"
-	"time"
+	"sync"
 
 	localv1alpha1 "github.com/openshift/local-storage-operator/pkg/apis/local/v1alpha1"
 	"github.com/openshift/local-storage-operator/pkg/common"
@@ -38,7 +38,7 @@ const (
 var log = logf.Log.WithName(ComponentName)
 
 // Add adds a new nodeside lvset controller to mgr
-func Add(mgr manager.Manager) error {
+func Add(mgr manager.Manager, cleanupTracker *provDeleter.CleanupStatusTracker, pvCache *provCache.VolumeCache, provisionerMux *sync.Mutex) error {
 
 	clientSet := provCommon.SetupClient()
 
@@ -46,7 +46,7 @@ func Add(mgr manager.Manager) error {
 		UserConfig: &provCommon.UserConfig{
 			Node: &corev1.Node{},
 		},
-		Cache:    provCache.NewVolumeCache(),
+		Cache:    pvCache,
 		VolUtil:  provUtil.NewVolumeUtil(),
 		APIUtil:  provUtil.NewAPIUtil(clientSet),
 		Client:   clientSet,
@@ -55,7 +55,6 @@ func Add(mgr manager.Manager) error {
 		// InformerFactory: , // unused
 
 	}
-	cleanupTracker := &provDeleter.CleanupStatusTracker{ProcTable: provDeleter.NewProcTable()}
 	clock := &wallTime{}
 	crClient := mgr.GetClient()
 	r := &ReconcileLocalVolumeSet{
@@ -64,6 +63,7 @@ func Add(mgr manager.Manager) error {
 		nodeName:       getNodeNameEnvVar(),
 		eventReporter:  newEventReporter(mgr.GetEventRecorderFor(ComponentName)),
 		deviceAgeMap:   newAgeMap(clock),
+		provisionerMux: provisionerMux,
 		cleanupTracker: cleanupTracker,
 		runtimeConfig:  runtimeConfig,
 		deleter:        provDeleter.NewDeleter(runtimeConfig, cleanupTracker),
@@ -98,25 +98,25 @@ func Add(mgr manager.Manager) error {
 		GenericFunc: func(e event.GenericEvent, q workqueue.RateLimitingInterface) {
 			pv, ok := e.Object.(*corev1.PersistentVolume)
 			if ok {
-				handlePVChange(runtimeConfig, pv, q, false)
+				handlePVChange(runtimeConfig, pv, q)
 			}
 		},
 		CreateFunc: func(e event.CreateEvent, q workqueue.RateLimitingInterface) {
 			pv, ok := e.Object.(*corev1.PersistentVolume)
 			if ok {
-				handlePVChange(runtimeConfig, pv, q, false)
+				handlePVChange(runtimeConfig, pv, q)
 			}
 		},
 		UpdateFunc: func(e event.UpdateEvent, q workqueue.RateLimitingInterface) {
 			pv, ok := e.ObjectNew.(*corev1.PersistentVolume)
 			if ok {
-				handlePVChange(runtimeConfig, pv, q, false)
+				handlePVChange(runtimeConfig, pv, q)
 			}
 		},
 		DeleteFunc: func(e event.DeleteEvent, q workqueue.RateLimitingInterface) {
 			pv, ok := e.Object.(*corev1.PersistentVolume)
 			if ok {
-				handlePVChange(runtimeConfig, pv, q, true)
+				handlePVChange(runtimeConfig, pv, q)
 			}
 		},
 	})
@@ -127,18 +127,11 @@ func Add(mgr manager.Manager) error {
 	return err
 }
 
-func handlePVChange(runtimeConfig *provCommon.RuntimeConfig, pv *corev1.PersistentVolume, q workqueue.RateLimitingInterface, isDelete bool) {
+func handlePVChange(runtimeConfig *provCommon.RuntimeConfig, pv *corev1.PersistentVolume, q workqueue.RateLimitingInterface) {
 	// skip non-owned PVs
 	name, found := pv.Annotations[provCommon.AnnProvisionedBy]
 	if !found || name != runtimeConfig.Name {
 		return
-	}
-
-	// update cache
-	if isDelete {
-		removePV(runtimeConfig, *pv)
-	} else {
-		addOrUpdatePV(runtimeConfig, *pv)
 	}
 
 	// enqueue owner
@@ -150,11 +143,13 @@ func handlePVChange(runtimeConfig *provCommon.RuntimeConfig, pv *corev1.Persiste
 	if !found {
 		return
 	}
-	q.Add(reconcile.Request{NamespacedName: types.NamespacedName{Name: ownerName, Namespace: ownerNamespace}})
-	if isDelete {
-		time.Sleep(time.Second * 10)
-		q.Add(reconcile.Request{NamespacedName: types.NamespacedName{Name: ownerName, Namespace: ownerNamespace}})
+
+	ownerKind, found := pv.Labels[common.PVOwnerKindLabel]
+	if ownerKind != localv1alpha1.LocalVolumeSetKind || !found {
+		return
 	}
+	q.Add(reconcile.Request{NamespacedName: types.NamespacedName{Name: ownerName, Namespace: ownerNamespace}})
+
 }
 
 // blank assignment to verify that ReconcileLocalVolumeSet implements reconcile.Reconciler
@@ -168,7 +163,8 @@ type ReconcileLocalVolumeSet struct {
 	eventReporter *eventReporter
 	nodeName      string
 	// map from KNAME of device to time when the device was first observed since the process started
-	deviceAgeMap *ageMap
+	deviceAgeMap   *ageMap
+	provisionerMux *sync.Mutex
 
 	// static-provisioner stuff
 	cleanupTracker *provDeleter.CleanupStatusTracker

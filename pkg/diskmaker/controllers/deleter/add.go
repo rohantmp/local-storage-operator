@@ -1,10 +1,9 @@
-package lv
+package deleter
 
 import (
 	"sync"
+	"time"
 
-	"github.com/openshift/local-storage-operator/pkg/apis"
-	localv1 "github.com/openshift/local-storage-operator/pkg/apis/local/v1"
 	"github.com/openshift/local-storage-operator/pkg/common"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -20,26 +19,30 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	//event "github.com/openshift/local-storage-operator/pkg/diskmaker"
-
 	// sig-local-static-provisioner libs
 	provCache "sigs.k8s.io/sig-storage-local-static-provisioner/pkg/cache"
 	provCommon "sigs.k8s.io/sig-storage-local-static-provisioner/pkg/common"
-
 	provDeleter "sigs.k8s.io/sig-storage-local-static-provisioner/pkg/deleter"
 	provUtil "sigs.k8s.io/sig-storage-local-static-provisioner/pkg/util"
 )
 
-const (
-	// ComponentName for lv symlinker
-	ComponentName = "localvolume-symlink-controller"
-)
+const ComponentName = "deleter"
 
 var log = logf.Log.WithName(ComponentName)
 
-// Add adds a new nodeside lv controller to mgr
+type ReconcileDeleter struct {
+	// This client, initialized using mgr.Client() above, is a split client
+	// that reads objects from the cache and writes to the apiserver
+	client         client.Client
+	scheme         *runtime.Scheme
+	cleanupTracker *provDeleter.CleanupStatusTracker
+	runtimeConfig  *provCommon.RuntimeConfig
+	deleter        *provDeleter.Deleter
+	firstRunOver   bool
+	provisionerMux *sync.Mutex
+}
+
 func Add(mgr manager.Manager, cleanupTracker *provDeleter.CleanupStatusTracker, pvCache *provCache.VolumeCache, provisionerMux *sync.Mutex) error {
-	apis.AddToScheme(mgr.GetScheme())
 	// populate the pv cache
 	clientSet := provCommon.SetupClient()
 	runtimeConfig := &provCommon.RuntimeConfig{
@@ -56,34 +59,20 @@ func Add(mgr manager.Manager, cleanupTracker *provDeleter.CleanupStatusTracker, 
 
 	}
 
-	r := &ReconcileLocalVolume{
-		client:    mgr.GetClient(),
-		scheme:    mgr.GetScheme(),
-		eventSync: newEventReporter(mgr.GetEventRecorderFor(ComponentName)),
-		// TODO: switch with the getter method
-		symlinkLocation: "/mnt/local-storage",
-		cleanupTracker:  cleanupTracker,
-		runtimeConfig:   runtimeConfig,
-		deleter:         provDeleter.NewDeleter(runtimeConfig, cleanupTracker),
-		provisionerMux:  provisionerMux,
+	r := &ReconcileDeleter{
+		provisionerMux: provisionerMux,
+		runtimeConfig:  runtimeConfig,
 	}
+
 	// Create a new controller
-	//	apis.AddToScheme(r.scheme)
-	c, err := controller.New(ComponentName, mgr, controller.Options{Reconciler: r})
-	if err != nil {
-		return err
-	}
-
-	err = c.Watch(&source.Kind{Type: &corev1.ConfigMap{}}, &handler.EnqueueRequestForOwner{
-		OwnerType: &localv1.LocalVolume{},
+	c, err := controller.New(ComponentName, mgr, controller.Options{
+		Reconciler: r,
+		// set to 1 explicitly, despite it being the default, as the reconciler is not thread-safe.
+		MaxConcurrentReconciles: 1,
 	})
-
-	err = c.Watch(&source.Kind{Type: &localv1.LocalVolume{}}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return err
 	}
-
-	// TODO enqueue for the PV based on labels
 
 	// update owned-pv cache used by provisioner/deleter libs and enequeue owning lvset
 	// only the cache is touched by
@@ -91,39 +80,48 @@ func Add(mgr manager.Manager, cleanupTracker *provDeleter.CleanupStatusTracker, 
 		GenericFunc: func(e event.GenericEvent, q workqueue.RateLimitingInterface) {
 			pv, ok := e.Object.(*corev1.PersistentVolume)
 			if ok {
-				handlePVChange(runtimeConfig, pv, q)
+				handlePVChange(runtimeConfig, pv, q, false)
 			}
 		},
 		CreateFunc: func(e event.CreateEvent, q workqueue.RateLimitingInterface) {
 			pv, ok := e.Object.(*corev1.PersistentVolume)
 			if ok {
-				handlePVChange(runtimeConfig, pv, q)
+				handlePVChange(runtimeConfig, pv, q, false)
 			}
 		},
 		UpdateFunc: func(e event.UpdateEvent, q workqueue.RateLimitingInterface) {
 			pv, ok := e.ObjectNew.(*corev1.PersistentVolume)
 			if ok {
-				handlePVChange(runtimeConfig, pv, q)
+				handlePVChange(runtimeConfig, pv, q, false)
 			}
 		},
 		DeleteFunc: func(e event.DeleteEvent, q workqueue.RateLimitingInterface) {
 			pv, ok := e.Object.(*corev1.PersistentVolume)
 			if ok {
-				handlePVChange(runtimeConfig, pv, q)
+				handlePVChange(runtimeConfig, pv, q, true)
 			}
 		},
 	})
 	if err != nil {
 		return err
 	}
+
 	return nil
+
 }
 
-func handlePVChange(runtimeConfig *provCommon.RuntimeConfig, pv *corev1.PersistentVolume, q workqueue.RateLimitingInterface) {
+func handlePVChange(runtimeConfig *provCommon.RuntimeConfig, pv *corev1.PersistentVolume, q workqueue.RateLimitingInterface, isDelete bool) {
 	// skip non-owned PVs
 	name, found := pv.Annotations[provCommon.AnnProvisionedBy]
 	if !found || name != runtimeConfig.Name {
 		return
+	}
+
+	// update cache
+	if isDelete {
+		removePV(runtimeConfig, *pv)
+	} else {
+		addOrUpdatePV(runtimeConfig, *pv)
 	}
 
 	// enqueue owner
@@ -135,28 +133,25 @@ func handlePVChange(runtimeConfig *provCommon.RuntimeConfig, pv *corev1.Persiste
 	if !found {
 		return
 	}
-	ownerKind, found := pv.Labels[common.PVOwnerKindLabel]
-	if ownerKind != localv1.LocalVolumeKind || !found {
-		return
-	}
-
 	q.Add(reconcile.Request{NamespacedName: types.NamespacedName{Name: ownerName, Namespace: ownerNamespace}})
-
+	if isDelete {
+		time.Sleep(time.Second * 10)
+		q.Add(reconcile.Request{NamespacedName: types.NamespacedName{Name: ownerName, Namespace: ownerNamespace}})
+	}
 }
 
-type ReconcileLocalVolume struct {
-	client          client.Client
-	scheme          *runtime.Scheme
-	symlinkLocation string
-	localVolume     *localv1.LocalVolume
-	eventSync       *eventReporter
-
-	// static-provisioner stuff
-	provisionerMux *sync.Mutex
-	cleanupTracker *provDeleter.CleanupStatusTracker
-	runtimeConfig  *provCommon.RuntimeConfig
-	deleter        *provDeleter.Deleter
-	firstRunOver   bool
+func addOrUpdatePV(r *provCommon.RuntimeConfig, pv corev1.PersistentVolume) {
+	_, exists := r.Cache.GetPV(pv.GetName())
+	if exists {
+		r.Cache.UpdatePV(&pv)
+	} else {
+		r.Cache.AddPV(&pv)
+	}
 }
 
-var _ reconcile.Reconciler = &ReconcileLocalVolume{}
+func removePV(r *provCommon.RuntimeConfig, pv corev1.PersistentVolume) {
+	_, exists := r.Cache.GetPV(pv.GetName())
+	if exists {
+		r.Cache.DeletePV(pv.Name)
+	}
+}
