@@ -44,6 +44,7 @@ func (r *ReconcileDeleter) Reconcile(request reconcile.Request) (reconcile.Resul
 	// enqueue if cache is not initialized
 	// and if any pv has phase == Releaseds
 
+	// mux for runtimeConfig access
 	r.provisionerMux.Lock()
 	defer r.provisionerMux.Unlock()
 

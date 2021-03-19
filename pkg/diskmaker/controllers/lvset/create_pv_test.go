@@ -197,6 +197,10 @@ func TestCreatePV(t *testing.T) {
 
 		// fake setup
 		tc.lvset.Spec.VolumeMode = localv1.PersistentVolumeMode(tc.desiredVolMode)
+		if tc.lvset.Namespace == "" {
+			tc.lvset.Namespace = "default"
+		}
+		tc.lvset.Kind = localv1alpha1.LocalVolumeSetKind
 		r, testConfig := newFakeLocalVolumeSetReconciler(t, &tc.lvset, &tc.node, &tc.sc)
 		r.nodeName = tc.node.Name
 		testConfig.runtimeConfig.Node = &tc.node
@@ -220,11 +224,14 @@ func TestCreatePV(t *testing.T) {
 		}
 		testConfig.fakeVolUtil.AddNewDirEntries("/mnt/local-storage/", dirFiles)
 
-		err := r.createPV(
+		err := common.CreateLocalPV(
 			&tc.lvset,
+			r.runtimeConfig,
+			r.cleanupTracker,
 			log.WithName("testLogger"),
 			tc.sc,
 			tc.mountPoints,
+			r.client,
 			tc.symlinkpath,
 			tc.deviceName,
 			true,
@@ -239,7 +246,7 @@ func TestCreatePV(t *testing.T) {
 			return
 		}
 		pv := &corev1.PersistentVolume{}
-		err = r.client.Get(context.TODO(), types.NamespacedName{Name: generatePVName(filepath.Base(tc.symlinkpath), tc.node.GetName(), tc.sc.GetName())}, pv)
+		err = r.client.Get(context.TODO(), types.NamespacedName{Name: common.GeneratePVName(filepath.Base(tc.symlinkpath), tc.node.GetName(), tc.sc.GetName())}, pv)
 
 		// capacity accurate
 		pvCapacity, found := pv.Spec.Capacity["storage"]
@@ -249,7 +256,7 @@ func TestCreatePV(t *testing.T) {
 		assert.Truef(t, pvCapacity.Equal(expectedCapacity), "actual: %s,expected: %s", pvCapacity, expectedCapacity)
 
 		// pvName accurate
-		assert.Equal(t, generatePVName(filepath.Base(tc.symlinkpath), tc.node.Name, tc.sc.Name), pv.Name)
+		assert.Equal(t, common.GeneratePVName(filepath.Base(tc.symlinkpath), tc.node.Name, tc.sc.Name), pv.Name)
 
 		// symlinkPath accurate
 		assert.NotNil(t, pv.Spec.Local)
@@ -262,11 +269,14 @@ func TestCreatePV(t *testing.T) {
 		assert.Equal(t, *tc.sc.ReclaimPolicy, pv.Spec.PersistentVolumeReclaimPolicy)
 
 		// test idempotency by running again
-		err = r.createPV(
+		err = common.CreateLocalPV(
 			&tc.lvset,
+			r.runtimeConfig,
+			r.cleanupTracker,
 			log.WithName("testLogger"),
 			tc.sc,
 			tc.mountPoints,
+			r.client,
 			tc.symlinkpath,
 			tc.deviceName,
 			true,

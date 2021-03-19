@@ -11,6 +11,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -18,10 +19,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+
+	provCommon "sigs.k8s.io/sig-storage-local-static-provisioner/pkg/common"
 )
 
 func TestFindMatchingDisk(t *testing.T) {
-	d := getFakeDiskMaker(t, nil, "/mnt/local-storage")
+	d := getFakeDiskMaker(t, "/mnt/local-storage")
 	blockDevices := []internal.BlockDevice{
 		{
 			Name:  "sdb1",
@@ -87,7 +91,7 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatalf("error writing yaml to disk : %v", err)
 	}
 
-	d := getFakeDiskMaker(t, lv, "/mnt/local-storage")
+	d := getFakeDiskMaker(t, "/mnt/local-storage", lv)
 	d.localVolume = lv
 	diskConfigFromDisk := d.generateConfig()
 
@@ -121,10 +125,30 @@ func TestCreateSymLinkByDeviceID(t *testing.T) {
 			Namespace: "default",
 		},
 	}
-	d := getFakeDiskMaker(t, lv, tmpSymLinkTargetDir)
+	sc := &storagev1.StorageClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "foobar",
+		},
+	}
+	d := getFakeDiskMaker(t, tmpSymLinkTargetDir, lv, sc)
 	diskLocation := DiskLocation{fakeDisk.Name(), fakeDiskByID.Name()}
 
-	d.createSymLink(diskLocation, tmpSymLinkTargetDir)
+	d.runtimeConfig = &provCommon.RuntimeConfig{
+		UserConfig: &provCommon.UserConfig{
+			DiscoveryMap: map[string]provCommon.MountConfig{
+				sc.ObjectMeta.Name: provCommon.MountConfig{
+					FsType: string(corev1.PersistentVolumeBlock),
+				},
+			},
+			Node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "nodename-a",
+					Labels: map[string]string{corev1.LabelHostname: "node-hostname-a"},
+				},
+			},
+		},
+	}
+	d.createSymlink(diskLocation, tmpSymLinkTargetDir, sc.GetName(), lv, log, sets.NewString())
 
 	// assert that target symlink is created for disk ID when both disk name and disk by-id are available
 	assert.Truef(t, hasFile(t, tmpSymLinkTargetDir, "diskID"), "failed to find symlink with disk ID in %s directory", tmpSymLinkTargetDir)
@@ -146,29 +170,32 @@ func TestCreateSymLinkByDeviceName(t *testing.T) {
 			Namespace: "default",
 		},
 	}
+	sc := &storagev1.StorageClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "foobar",
+		},
+	}
 
-	d := getFakeDiskMaker(t, lv, tmpSymLinkTargetDir)
+	d := getFakeDiskMaker(t, tmpSymLinkTargetDir, lv, sc)
 	diskLocation := DiskLocation{fakeDisk.Name(), ""}
-	d.createSymLink(diskLocation, tmpSymLinkTargetDir)
+	d.createSymlink(diskLocation, tmpSymLinkTargetDir, sc.GetName(), lv, log, sets.NewString())
 
 	// assert that target symlink is created for disk name when no disk ID is available
 	assert.Truef(t, hasFile(t, tmpSymLinkTargetDir, "diskName"), "failed to find symlink with disk name in %s directory", tmpSymLinkTargetDir)
 }
 
-func getFakeDiskMaker(t *testing.T, objs runtime.Object, symlinkLocation string) *ReconcileLocalVolume {
+func getFakeDiskMaker(t *testing.T, symlinkLocation string, objs ...runtime.Object) *ReconcileLocalVolume {
 	r := &ReconcileLocalVolume{symlinkLocation: symlinkLocation}
 	scheme, err := localv1.SchemeBuilder.Build()
 	assert.NoErrorf(t, err, "creating scheme")
 	err = corev1.AddToScheme(scheme)
 	assert.NoErrorf(t, err, "adding corev1 to scheme")
 
+	err = storagev1.AddToScheme(scheme)
+	assert.NoErrorf(t, err, "adding storagev1 to scheme")
 	err = appsv1.AddToScheme(scheme)
 	assert.NoErrorf(t, err, "adding appsv1 to scheme")
-	if objs != nil {
-		r.client = fake.NewFakeClientWithScheme(scheme, objs)
-	} else {
-		r.client = fake.NewFakeClientWithScheme(scheme)
-	}
+	r.client = fake.NewFakeClientWithScheme(scheme, objs...)
 
 	r.scheme = scheme
 	//apis.AddToScheme(r.scheme)

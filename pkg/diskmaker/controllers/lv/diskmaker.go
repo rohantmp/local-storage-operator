@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/openshift/local-storage-operator/pkg/common"
 	"github.com/openshift/local-storage-operator/pkg/internal"
 	corev1 "k8s.io/api/core/v1"
@@ -18,8 +19,8 @@ import (
 	staticProvisioner "sigs.k8s.io/sig-storage-local-static-provisioner/pkg/common"
 
 	localv1 "github.com/openshift/local-storage-operator/pkg/apis/local/v1"
+	storagev1 "k8s.io/api/storage/v1"
 
-	//	"github.com/prometheus/common/log"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -47,8 +48,14 @@ type DiskLocation struct {
 	diskID       string
 }
 
-func (r *ReconcileLocalVolume) createSymLink(deviceNameLocation DiskLocation, symLinkDirPath string) {
-
+func (r *ReconcileLocalVolume) createSymlink(
+	deviceNameLocation DiskLocation,
+	symLinkDirPath string,
+	storageClassName string,
+	lv *localv1.LocalVolume,
+	devLogger logr.Logger,
+	mountPointMap sets.String,
+) bool {
 	var symLinkSource, symLinkTarget string
 	var isSymLinkedByDeviceName bool
 	if deviceNameLocation.diskID != "" {
@@ -59,9 +66,6 @@ func (r *ReconcileLocalVolume) createSymLink(deviceNameLocation DiskLocation, sy
 		symLinkTarget = getSymlinkTarget(deviceNameLocation.diskNamePath, symLinkDirPath)
 		isSymLinkedByDeviceName = true
 	}
-
-	// TODO: check if the existingSymlink is to our symlinkTarget, if it is,
-	// then skip symlink creation and continue to create PV
 
 	// get PV creation lock which checks for existing symlinks to this device
 	pvLock, pvLocked, existingSymlinks, err := internal.GetPVCreationLock(
@@ -79,10 +83,15 @@ func (r *ReconcileLocalVolume) createSymLink(deviceNameLocation DiskLocation, sy
 	defer unlockFunc()
 
 	if len(existingSymlinks) > 0 { // already claimed, fail silently
-		return
+		for _, path := range existingSymlinks {
+			if path == symLinkTarget { // symlinked in this folder, ensure the PV exists
+				return true
+			}
+		}
+		return false
 	} else if err != nil || !pvLocked { // locking failed for some other reasion
 		klog.Errorf("not symlinking, could not get lock: %v", err)
-		return
+		return false
 	}
 
 	err = os.MkdirAll(symLinkDirPath, 0755)
@@ -90,12 +99,12 @@ func (r *ReconcileLocalVolume) createSymLink(deviceNameLocation DiskLocation, sy
 		msg := fmt.Sprintf("error creating symlink dir %s: %v", symLinkDirPath, err)
 		r.eventSync.Report(r.localVolume, newDiskEvent(ErrorFindingMatchingDisk, msg, symLinkTarget, corev1.EventTypeWarning))
 		klog.Errorf(msg)
-		return
+		return false
 	}
 
 	if fileExists(symLinkTarget) {
 		klog.V(4).Infof("symlink %s already exists", symLinkTarget)
-		return
+		return true
 	}
 
 	err = os.Symlink(symLinkSource, symLinkTarget)
@@ -103,17 +112,18 @@ func (r *ReconcileLocalVolume) createSymLink(deviceNameLocation DiskLocation, sy
 		msg := fmt.Sprintf("error creating symlink %s: %v", symLinkTarget, err)
 		r.eventSync.Report(r.localVolume, newDiskEvent(ErrorFindingMatchingDisk, msg, symLinkSource, corev1.EventTypeWarning))
 		klog.Errorf(msg)
-		return
+		return false
 	}
 
 	if isSymLinkedByDeviceName {
 		msg := fmt.Sprintf("created symlink on device name %s with no disk/by-id. device name might not persist on reboot", symLinkSource)
 		r.eventSync.Report(r.localVolume, newDiskEvent(SymLinkedOnDeviceName, msg, symLinkSource, corev1.EventTypeWarning))
 		klog.Warningf(msg)
-		return
 	}
 	successMsg := fmt.Sprintf("found matching disk %s with id %s", deviceNameLocation.diskNamePath, deviceNameLocation.diskID)
 	r.eventSync.Report(r.localVolume, newDiskEvent(FoundMatchingDisk, successMsg, deviceNameLocation.diskNamePath, corev1.EventTypeNormal))
+	return true
+
 }
 func diskMakerLabels(crName string) map[string]string {
 	return map[string]string{
@@ -187,6 +197,15 @@ func (r *ReconcileLocalVolume) Reconcile(request reconcile.Request) (reconcile.R
 	}
 
 	r.localVolume = lv
+
+	// don't provision for deleted lvs
+	if !lv.DeletionTimestamp.IsZero() {
+		return reconcile.Result{}, nil
+	}
+
+	// mux for runtimeConfig access
+	r.provisionerMux.Lock()
+	defer r.provisionerMux.Unlock()
 
 	// ignore LocalVolumes whose LabelSelector doesn't match this node
 	// NodeSelectorTerms.MatchExpressions are ORed
@@ -320,10 +339,42 @@ func (r *ReconcileLocalVolume) Reconcile(request reconcile.Request) (reconcile.R
 		return reconcile.Result{}, nil
 	}
 
-	for storageClass, deviceArray := range deviceMap {
+	mountPointMap, err := common.GenerateMountMap(r.runtimeConfig)
+	if err != nil {
+		reqLogger.Error(err, "failed to generate mountPointMap")
+		return reconcile.Result{}, err
+	}
+
+	for storageClassName, deviceArray := range deviceMap {
 		for _, deviceNameLocation := range deviceArray {
-			symLinkDirPath := path.Join(r.symlinkLocation, storageClass)
-			r.createSymLink(deviceNameLocation, symLinkDirPath)
+			devLogger := reqLogger.WithValues("Device.Name", deviceNameLocation.diskNamePath)
+			symLinkDirPath := path.Join(r.symlinkLocation, storageClassName)
+			shouldCreatePV := r.createSymlink(deviceNameLocation, symLinkDirPath, storageClassName, lv, devLogger, mountPointMap)
+			if shouldCreatePV {
+
+				storageClass := &storagev1.StorageClass{}
+				err := r.client.Get(context.TODO(), types.NamespacedName{Name: storageClassName}, storageClass)
+				if err != nil {
+					// TODO: reconsider it for break or reconciling it
+					devLogger.Error(err, "failed to fetch storageClass")
+					return reconcile.Result{}, err
+				}
+				err = common.CreateLocalPV(
+					lv,
+					r.runtimeConfig,
+					r.cleanupTracker,
+					devLogger,
+					*storageClass,
+					mountPointMap,
+					r.client,
+					"", // TODO post rebase
+					deviceNameLocation.diskNamePath,
+					true,
+				)
+				if err != nil {
+					devLogger.Error(err, "could not create local PV")
+				}
+			}
 		}
 	}
 

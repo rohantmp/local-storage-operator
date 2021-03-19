@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"os"
 	"path"
 	"path/filepath"
@@ -46,6 +45,15 @@ func (r *ReconcileLocalVolumeSet) Reconcile(request reconcile.Request) (reconcil
 		// Error reading the object - requeue the request.
 		return reconcile.Result{}, err
 	}
+
+	// don't provision for deleted lvsets
+	if !lvset.DeletionTimestamp.IsZero() {
+		return reconcile.Result{}, nil
+	}
+
+	// mux for runtimeConfig access
+	r.provisionerMux.Lock()
+	defer r.provisionerMux.Unlock()
 
 	// get the node and determine if the localvolumeset selects this node
 	r.runtimeConfig.Node = &corev1.Node{}
@@ -181,16 +189,9 @@ func (r *ReconcileLocalVolumeSet) Reconcile(request reconcile.Request) (reconcil
 			break
 		}
 
-		// Retrieve list of mount points to iterate through discovered paths (aka files) below
-		mountPoints, err := r.runtimeConfig.Mounter.List()
+		mountPointMap, err := common.GenerateMountMap(r.runtimeConfig)
 		if err != nil {
-			return reconcile.Result{}, fmt.Errorf("error retrieving mountpoints: %w", err)
-		}
-		// Put mount points into set for faster checks below
-		type empty struct{}
-		mountPointMap := sets.NewString()
-		for _, mp := range mountPoints {
-			mountPointMap.Insert(mp.Path)
+			return reconcile.Result{}, err
 		}
 
 		devLogger.Info("provisioning PV")
@@ -364,7 +365,18 @@ func (r *ReconcileLocalVolumeSet) provisionPV(
 	if len(existingSymlinks) > 0 { // already claimed
 		for _, path := range existingSymlinks {
 			if path == symlinkPath { // symlinked in this folder, ensure the PV exists
-				return r.createPV(obj, devLogger, storageClass, mountPointMap, symlinkPath, dev.KName, idExists)
+				return common.CreateLocalPV(
+					obj,
+					r.runtimeConfig,
+					r.cleanupTracker,
+					devLogger,
+					storageClass,
+					mountPointMap,
+					r.client,
+					symlinkPath,
+					dev.KName,
+					idExists,
+				)
 			}
 		}
 		return nil
@@ -389,22 +401,35 @@ func (r *ReconcileLocalVolumeSet) provisionPV(
 				// existing file evals to disk
 			} else if valid {
 				// if file exists and is accurate symlink, create pv
-				return r.createPV(obj, devLogger, storageClass, mountPointMap, symlinkPath, dev.KName, idExists)
+				return common.CreateLocalPV(
+					obj,
+					r.runtimeConfig,
+					r.cleanupTracker,
+					devLogger,
+					storageClass,
+					mountPointMap,
+					r.client,
+					symlinkPath,
+					dev.KName,
+					idExists,
+				)
 			}
 		}
 	} else if err != nil {
 		return err
 	}
-	return r.createPV(obj, devLogger, storageClass, mountPointMap, symlinkPath, dev.KName, idExists)
-}
-
-func generatePVName(file, node, class string) string {
-	h := fnv.New32a()
-	h.Write([]byte(file))
-	h.Write([]byte(node))
-	h.Write([]byte(class))
-	// This is the FNV-1a 32-bit hash
-	return fmt.Sprintf("local-pv-%x", h.Sum32())
+	return common.CreateLocalPV(
+		obj,
+		r.runtimeConfig,
+		r.cleanupTracker,
+		devLogger,
+		storageClass,
+		mountPointMap,
+		r.client,
+		symlinkPath,
+		dev.KName,
+		idExists,
+	)
 }
 
 func getSymLinkSourceAndTarget(dev internal.BlockDevice, symlinkDir string) (string, string, bool, error) {
