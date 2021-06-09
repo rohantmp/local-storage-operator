@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	localv1alpha1 "github.com/openshift/local-storage-operator/pkg/apis/local/v1alpha1"
 	"github.com/openshift/local-storage-operator/pkg/common"
@@ -150,7 +151,6 @@ func TestPVProtectionFinalizer(t *testing.T) {
 				newPV(newLV(false, nameA), corev1.VolumeAvailable),
 				newPV(newLV(false, nameA), corev1.VolumeFailed),
 				newPV(newLV(false, nameA), corev1.VolumePending),
-				newPV(newLV(false, nameA), corev1.VolumeReleased),
 			},
 			lvSetResults: []lvSetResult{
 				{
@@ -167,7 +167,6 @@ func TestPVProtectionFinalizer(t *testing.T) {
 				newPV(newLV(false, nameA), corev1.VolumeAvailable),
 				newPV(newLV(false, nameA), corev1.VolumeFailed),
 				newPV(newLV(false, nameA), corev1.VolumePending),
-				newPV(newLV(false, nameA), corev1.VolumeReleased),
 				// has bound
 				newPV(newLV(false, nameB), corev1.VolumeAvailable),
 				newPV(newLV(false, nameB), corev1.VolumeBound),
@@ -238,6 +237,23 @@ func TestPVProtectionFinalizer(t *testing.T) {
 				},
 			},
 		},
+		// no bound pvs, no deletion timestamp, expectFinalizer to be created
+		{
+			desc: "3c: deletion blocked,  released PV",
+			existingPVs: []corev1.PersistentVolume{
+				// all types
+				newPV(newLV(false, nameA), corev1.VolumeAvailable),
+				newPV(newLV(false, nameA), corev1.VolumeFailed),
+				newPV(newLV(false, nameA), corev1.VolumePending),
+				newPV(newLV(false, nameA), corev1.VolumeReleased),
+			},
+			lvSetResults: []lvSetResult{
+				{
+					lvSet:           newLV(true, nameA),
+					expectFinalizer: true,
+				},
+			},
+		},
 	}
 
 	for _, testCase := range testTable {
@@ -258,12 +274,12 @@ func TestPVProtectionFinalizer(t *testing.T) {
 			lvSetKey := types.NamespacedName{Name: result.lvSet.GetName(), Namespace: result.lvSet.GetNamespace()}
 
 			// to debug specific test cases uncomment this and change desc and lvset name and place breakpoints
-			// if testCase.desc == "2b: deletion unblocked, crowded" {
-			// 	time.Sleep(0)
-			// 	if result.lvSet.Name == "b" {
-			// 		time.Sleep(0)
-			// 	}
-			// }
+			if testCase.desc == "3c: deletion blocked,  released PV" {
+				time.Sleep(0)
+				if result.lvSet.Name == "s" {
+					time.Sleep(0)
+				}
+			}
 
 			// reconcile successfully
 			_, err := reconciler.Reconcile(reconcile.Request{NamespacedName: lvSetKey})
