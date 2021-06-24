@@ -6,6 +6,7 @@ require (
 	github.com/aws/aws-sdk-go v1.17.7
 	github.com/ghodss/yaml v1.0.1-0.20190212211648-25d852aebe32
 	github.com/go-logr/logr v0.1.0
+	github.com/libstorage/libstoragemgmt-golang v0.0.0-20201029170358-5d91ecc3750a
 	github.com/onsi/gomega v1.8.1
 	github.com/openshift/api v3.9.1-0.20190924102528-32369d4db2ad+incompatible
 	github.com/openshift/client-go v0.0.0-20200116152001-92a2713fa240
