@@ -8,6 +8,9 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	lsm "github.com/libstorage/libstoragemgmt-golang"
+	lsmErrors "github.com/libstorage/libstoragemgmt-golang/errors"
+	localDisk "github.com/libstorage/libstoragemgmt-golang/localdisk"
 	localv1alpha1 "github.com/openshift/local-storage-operator/pkg/apis/local/v1alpha1"
 	"github.com/openshift/local-storage-operator/pkg/common"
 	"github.com/openshift/local-storage-operator/pkg/diskmaker"
@@ -121,6 +124,36 @@ func (r *ReconcileLocalVolumeSet) Reconcile(request reconcile.Request) (reconcil
 	} else if len(badRows) > 0 {
 		r.eventReporter.Report(lvset, newDiskEvent(diskmaker.ErrorRunningBlockList, fmt.Sprintf("error parsing rows: %+v", badRows), "", corev1.EventTypeWarning))
 		reqLogger.Error(fmt.Errorf("bad rows"), "could not parse all the lsblk rows", "lsblk.BadRows", badRows)
+	}
+
+	var healthText = map[lsm.DiskHealthStatus]string{
+		lsm.DiskHealthStatusUnknown: "Unknown",
+		lsm.DiskHealthStatusFail:    "Fail",
+		lsm.DiskHealthStatusWarn:    "Warn",
+		lsm.DiskHealthStatusGood:    "Good",
+	}
+	_ = healthText
+
+	for _, blockDevice := range blockDevices {
+		// get /dev/KNAME path
+		devPath, err := blockDevice.GetDevPath()
+		if err != nil {
+			reqLogger.Error(err, "couldn't get /dev/KNAME path")
+			return reconcile.Result{}, err
+		}
+		health, err := localDisk.HealthStatusGet(devPath)
+		if err != nil {
+			lsmErr := err.(*lsmErrors.LsmError)
+			reqLogger.Error(err, "couldn't get health")
+			if lsmErr.Code != lsmErrors.NoSupport {
+				return reconcile.Result{}, err
+			}
+		}
+		reqLogger.Info("checking dev health", "health", healthText[health])
+	}
+
+	if true {
+		return reconcile.Result{RequeueAfter: time.Second * 20}, nil
 	}
 
 	// find disks that match lvset filters and matchers

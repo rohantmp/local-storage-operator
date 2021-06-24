@@ -22,10 +22,10 @@ all build: build-diskmaker build-operator
 .PHONY: all build
 
 build-diskmaker:
-	env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -i -mod=vendor -a -i -ldflags '-X main.version=$(REV)' -o $(TARGET_DIR)/diskmaker $(CURPATH)/cmd/diskmaker
+	env CGO_LDFLAGS=/usr/lib64/libstoragemgmt.so GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -mod=vendor -a -ldflags '-X main.version=$(REV)' -o $(TARGET_DIR)/diskmaker $(CURPATH)/cmd/diskmaker
 
 build-operator:
-	env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -i -mod=vendor -a -i -ldflags '-X main.version=$(REV)' -o $(TARGET_DIR)/local-storage-operator $(CURPATH)/cmd/manager
+	env GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) go build -mod=vendor -a -ldflags '-X main.version=$(REV)' -o $(TARGET_DIR)/local-storage-operator $(CURPATH)/cmd/manager
 
 images: diskmaker-container operator-container must-gather
 
